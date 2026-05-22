@@ -11,12 +11,6 @@ Setup:
        DATABASE_URL = "postgresql://user:pass@ep-xxx.ap-south-1.aws.neon.tech/neondb?sslmode=require"
   4. pip install psycopg2-binary
   5. Run your app — tables are created automatically on first launch
-Local comment
-Comment on line R13
-
-
-Cancel
-Comment
 
 Connection string can also be set as an environment variable:
   export DATABASE_URL="postgresql://..."
