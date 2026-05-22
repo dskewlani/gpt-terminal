@@ -84,7 +84,7 @@ def safe_num_input(label, hardcoded_min, dynamic_max, step=1, key=None, **kwargs
     return st.number_input(label, safe_min, safe_max, safe_val, safe_step, key=key, **kwargs)
 
 # ─── Live Index Data ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=5)
 def get_indices():
     """Live index data from NSE India public API (no login, no API key)."""
     try:
