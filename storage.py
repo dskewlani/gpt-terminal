@@ -1,27 +1,15 @@
 """
-storage.py — ProTrader Terminal
-Persistent storage layer using Neon PostgreSQL (free tier).
-Drop-in replacement for the original JSON file-based storage.
-All function signatures are identical — app.py needs zero changes.
+Persistent key-value storage for the trading terminal.
 
-Setup:
-  1. Sign up at https://neon.tech (free, no credit card)
-  2. Create a project, copy the connection string
-  3. Add to .streamlit/secrets.toml:
-       DATABASE_URL = "postgresql://user:pass@ep-xxx.ap-south-1.aws.neon.tech/neondb?sslmode=require"
-  4. pip install psycopg2-binary
-  5. Run your app — tables are created automatically on first launch
-
-Connection string can also be set as an environment variable:
-  export DATABASE_URL="postgresql://..."
+Uses Neon/PostgreSQL when DATABASE_URL is configured and psycopg2 is installed.
+Falls back to in-memory storage when no database is available.
 """
 
 import json
-import os
-import time
 import logging
-from datetime import datetime
+import os
 from contextlib import contextmanager
+from datetime import datetime
 
 try:
     import psycopg2
@@ -30,66 +18,49 @@ try:
 except ImportError:
     PSYCOPG2_AVAILABLE = False
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("storage")
 
-# ─── Connection String Resolution ─────────────────────────────────────────────
+
 def _get_db_url() -> str:
-    """
-    Tries to get the DATABASE_URL from:
-    1. Streamlit secrets (st.secrets["DATABASE_URL"]) — preferred for Streamlit Cloud
-    2. Environment variable DATABASE_URL — preferred for local dev / other hosts
-    Returns empty string if neither is available.
-    """
-    # Try Streamlit secrets first
     try:
         import streamlit as st
         url = st.secrets.get("DATABASE_URL", "")
         if url:
-            return url
+            return str(url)
     except Exception:
         pass
-
-    # Fall back to environment variable
     return os.environ.get("DATABASE_URL", "")
 
 
 DATABASE_URL = _get_db_url()
+_pool = None
+_schema_initialised = False
+_mem = {}
 
-# ─── Connection Pool ───────────────────────────────────────────────────────────
-# A pool of 1–5 connections is ideal for a single-user Streamlit app.
-# Neon free tier allows up to ~100 connections but we stay conservative.
-_pool: "ThreadedConnectionPool | None" = None
 
-def _get_pool() -> "ThreadedConnectionPool | None":
+def _use_fallback() -> bool:
+    return not PSYCOPG2_AVAILABLE or not DATABASE_URL
+
+
+def _get_pool():
     global _pool
-    if not PSYCOPG2_AVAILABLE:
-        return None
-    if not DATABASE_URL:
+    if _use_fallback():
         return None
     if _pool is None:
         try:
             _pool = ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
-            log.info("[Storage] Connection pool created.")
-        except Exception as e:
-            log.error(f"[Storage] Failed to create connection pool: {e}")
+        except Exception as exc:
+            log.error("[Storage] connection pool failed: %s", exc)
             return None
     return _pool
 
+
 @contextmanager
 def _conn():
-    """
-    Context manager that checks out a connection from the pool,
-    commits on success, rolls back on error, and always returns
-    the connection to the pool.
-    """
     pool = _get_pool()
     if pool is None:
-        raise RuntimeError(
-            "[Storage] No database connection available. "
-            "Check DATABASE_URL in .streamlit/secrets.toml or environment variables."
-        )
+        raise RuntimeError("No database connection available.")
     conn = pool.getconn()
     try:
         yield conn
@@ -98,3 +69,114 @@ def _conn():
         conn.rollback()
         raise
     finally:
+        pool.putconn(conn)
+
+
+def _init_schema() -> None:
+    global _schema_initialised
+    if _schema_initialised:
+        return
+    if _use_fallback():
+        _schema_initialised = True
+        return
+
+    ddl = """
+        CREATE TABLE IF NOT EXISTS kv_store (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_kv_updated ON kv_store (updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS trade_log (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            symbol TEXT,
+            pnl NUMERIC,
+            win BOOLEAN,
+            strength NUMERIC,
+            rec TEXT,
+            trade_date DATE DEFAULT CURRENT_DATE,
+            logged_at TIMESTAMPTZ DEFAULT NOW(),
+            meta TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tradelog_date ON trade_log (trade_date DESC);
+
+        CREATE TABLE IF NOT EXISTS daily_pnl (
+            trade_date DATE PRIMARY KEY,
+            pnl NUMERIC NOT NULL DEFAULT 0,
+            trades INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+    except Exception as exc:
+        log.error("[Storage] schema init failed: %s", exc)
+    finally:
+        _schema_initialised = True
+
+
+def save(key: str, data) -> None:
+    _init_schema()
+    if _use_fallback():
+        _mem[key] = data
+        return
+
+    try:
+        serialised = json.dumps(data, default=str)
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO kv_store (key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (key, serialised),
+                )
+    except Exception as exc:
+        log.error("[Storage] save(%s): %s", key, exc)
+
+
+def load(key: str, default=None):
+    _init_schema()
+    if _use_fallback():
+        return _mem.get(key, default)
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM kv_store WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return default if row is None else json.loads(row[0])
+    except Exception as exc:
+        log.error("[Storage] load(%s): %s", key, exc)
+        return default
+
+
+def append_record(key: str, record: dict) -> None:
+    existing = load(key, default=[])
+    if not isinstance(existing, list):
+        existing = []
+    rec = dict(record)
+    rec["_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing.append(rec)
+    save(key, existing)
+
+
+def delete(key: str) -> None:
+    _init_schema()
+    if _use_fallback():
+        _mem.pop(key, None)
+        return
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM kv_store WHERE key = %s", (key,))
+    except Exception as exc:
+        log.error("[Storage] delete(%s): %s", key, exc)
